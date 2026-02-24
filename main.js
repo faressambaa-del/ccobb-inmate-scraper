@@ -15,14 +15,14 @@ const {
     proxyList     = [],
 } = input || {};
 
-// ── Pick a random US proxy from WebShare list ─────────────────────────────────
+// ── Pick a random proxy ───────────────────────────────────────────────────────
 function getRandomProxy() {
     if (!proxyList || proxyList.length === 0) return null;
     const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
-    return `http://${proxyUsername}:${proxyPassword}@${proxy}`;
+    return proxy; // returns "ip:port"
 }
 
-const selectedProxy = getRandomProxy();
+const selectedProxyHost = getRandomProxy();
 
 const INQUIRY_URL = [
     'http://inmate-search.cobbsheriff.org/inquiry.asp',
@@ -34,7 +34,7 @@ const INQUIRY_URL = [
 
 console.log(`Searching  → name="${name}"  mode="${mode}"`);
 console.log(`Target URL → ${INQUIRY_URL}`);
-console.log(`Proxy selected: ${selectedProxy ? selectedProxy.split('@')[1] : 'none'}`);
+console.log(`Proxy selected: ${selectedProxyHost || 'none'}`);
 
 // ── Result container ──────────────────────────────────────────────────────────
 let result = {
@@ -47,12 +47,7 @@ let result = {
     debugInfo     : {},
 };
 
-// ── Build launch args ─────────────────────────────────────────────────────────
-const proxyArgs = selectedProxy
-    ? [`--proxy-server=${new URL(selectedProxy).host}`]
-    : [];
-
-// ── Crawler ───────────────────────────────────────────────────────────────────
+// ── Crawler — proxy auth passed via launchOptions correctly ───────────────────
 const crawler = new PlaywrightCrawler({
 
     launchContext: {
@@ -63,21 +58,22 @@ const crawler = new PlaywrightCrawler({
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                ...proxyArgs,
+                // ✅ Correct way to set proxy in Playwright
+                ...(selectedProxyHost ? [`--proxy-server=http://${selectedProxyHost}`] : []),
             ],
         },
+        // ✅ Correct way to pass proxy credentials in Crawlee/Playwright
+        ...(selectedProxyHost && proxyUsername ? {
+            proxyUrl: `http://${proxyUsername}:${proxyPassword}@${selectedProxyHost}`,
+        } : {}),
     },
+
+    requestHandlerTimeoutSecs : 180,
+    navigationTimeoutSecs     : 60,
+    maxRequestRetries         : 2,
 
     preNavigationHooks: [
         async ({ page }) => {
-            if (selectedProxy) {
-                const u = new URL(selectedProxy);
-                await page.authenticate({
-                    username : decodeURIComponent(u.username),
-                    password : decodeURIComponent(u.password),
-                });
-            }
-            // Set realistic browser headers to avoid blocks
             await page.setExtraHTTPHeaders({
                 'User-Agent'      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept-Language' : 'en-US,en;q=0.9',
@@ -85,65 +81,60 @@ const crawler = new PlaywrightCrawler({
         },
     ],
 
-    requestHandlerTimeoutSecs : 180,
-    navigationTimeoutSecs     : 60,
-    maxRequestRetries         : 2,
-
     async requestHandler({ page, request, log }) {
         log.info(`Processing: ${request.url}`);
 
-        // Wait for page to load
         await page.waitForSelector('body', { timeout: 45000 });
         await sleep(3000);
 
         const pageText = (await page.textContent('body')) || '';
-        const pageHTML = await page.content();
 
         result.debugInfo.url      = request.url;
         result.debugInfo.bodyLen  = pageText.length;
-        result.debugInfo.bodySnip = pageText.substring(0, 300);
+        result.debugInfo.bodySnip = pageText.substring(0, 500);
 
-        log.info(`Page loaded. Body length: ${pageText.length}`);
-        log.info(`Body preview: ${pageText.substring(0, 200)}`);
+        log.info(`Page loaded. Length: ${pageText.length}`);
+        log.info(`Preview: ${pageText.substring(0, 300)}`);
 
         // ── No results check ──────────────────────────────────────────────────
         const noRecord =
-            /no record/i.test(pageText)  ||
-            /not found/i.test(pageText)  ||
-            /0 records/i.test(pageText)  ||
+            /no record/i.test(pageText) ||
+            /not found/i.test(pageText) ||
+            /0 records/i.test(pageText) ||
             /no inmates/i.test(pageText);
 
         if (noRecord) {
-            log.info('No inmate record found for this name.');
+            log.info('No inmate record found.');
             result.found = false;
             return;
         }
 
-        // ── Check if we landed directly on detail page ────────────────────────
+        // ── Detect if already on detail page ──────────────────────────────────
         const isDetailPage =
-            /Agency ID/i.test(pageText)  ||
-            /booking/i.test(pageText)    ||
-            /SOID/i.test(pageText)       ||
-            /Offense/i.test(pageText);
+            /Agency ID/i.test(pageText) ||
+            /Offense/i.test(pageText)   ||
+            /Bond/i.test(pageText);
 
         // ── If results list, click first inmate link ──────────────────────────
-        const firstLink = page.locator('a[href*="inquiry.asp"], a[href*="detail"], table a').first();
-        const hasLinks  = (await firstLink.count()) > 0;
+        if (!isDetailPage) {
+            const firstLink = page.locator('a[href*="inquiry.asp"], table a').first();
+            const hasLinks  = (await firstLink.count()) > 0;
 
-        if (hasLinks && !isDetailPage) {
-            log.info('Result list detected – clicking first inmate link …');
-            try {
-                await Promise.all([
-                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                    firstLink.click(),
-                ]);
-                await sleep(3000);
-            } catch (e) {
-                log.warning(`Navigation after click failed: ${e.message}`);
+            if (hasLinks) {
+                log.info('Result list detected – clicking first inmate link …');
+                try {
+                    await Promise.all([
+                        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
+                        firstLink.click(),
+                    ]);
+                    await sleep(3000);
+                } catch (e) {
+                    log.warning(`Click navigation failed: ${e.message}`);
+                }
             }
         }
 
-        // ── Scrape ALL table rows ─────────────────────────────────────────────
+        // ── Scrape all table rows ─────────────────────────────────────────────
         result.gotDetailPage = true;
         result.found         = true;
 
@@ -159,15 +150,14 @@ const crawler = new PlaywrightCrawler({
             return rows;
         });
 
-        // ── Also grab full page text as backup ────────────────────────────────
         const fullText = await page.evaluate(() => document.body.innerText);
 
         result.pageData.allRows  = allRows;
         result.pageData.fullText = fullText;
         result.debugInfo.rowCount = allRows.length;
 
-        log.info(`✅ Scraped ${allRows.length} rows from detail page.`);
-        log.info(`First few rows: ${JSON.stringify(allRows.slice(0, 3))}`);
+        log.info(`✅ Scraped ${allRows.length} rows.`);
+        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 3))}`);
     },
 
     failedRequestHandler({ request, error, log }) {
@@ -180,11 +170,8 @@ const crawler = new PlaywrightCrawler({
 // ── Run ───────────────────────────────────────────────────────────────────────
 await crawler.run([{ url: INQUIRY_URL }]);
 
-// ── Push to Apify dataset ─────────────────────────────────────────────────────
 await Actor.pushData(result);
 console.log('Done. found =', result.found, '| gotDetailPage =', result.gotDetailPage);
-if (result.debugInfo.error) {
-    console.log('Error details:', result.debugInfo.error);
-}
+if (result.debugInfo.error) console.log('Error:', result.debugInfo.error);
 
 await Actor.exit();
