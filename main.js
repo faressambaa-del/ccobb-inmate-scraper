@@ -3,7 +3,6 @@ import { PlaywrightCrawler, ProxyConfiguration, sleep } from 'crawlee';
 
 await Actor.init();
 
-// ── Input ────────────────────────────────────────────────────────────────────
 const input = await Actor.getInput();
 const {
     name          = '',
@@ -42,6 +41,15 @@ const proxyConfiguration = proxyUrls.length > 0
     ? new ProxyConfiguration({ proxyUrls })
     : undefined;
 
+// ── Helper: click a link and wait for new page to load ────────────────────────
+async function clickAndWait(page, locator, log, label) {
+    log.info(`Clicking: ${label}`);
+    await locator.click();
+    await page.waitForLoadState('networkidle', { timeout: 60000 });
+    await sleep(3000);
+    log.info(`After click [${label}] → URL: ${page.url()}`);
+}
+
 const crawler = new PlaywrightCrawler({
 
     ...(proxyConfiguration ? { proxyConfiguration } : {}),
@@ -67,30 +75,24 @@ const crawler = new PlaywrightCrawler({
         },
     ],
 
-    requestHandlerTimeoutSecs : 180,
-    navigationTimeoutSecs     : 60,
+    requestHandlerTimeoutSecs : 300,
+    navigationTimeoutSecs     : 90,
     maxRequestRetries         : 2,
 
     async requestHandler({ page, request, log }) {
         log.info(`Processing: ${request.url}`);
 
-        await page.waitForSelector('body', { timeout: 45000 });
+        await page.waitForLoadState('networkidle', { timeout: 60000 });
         await sleep(3000);
 
-        const pageText = (await page.textContent('body')) || '';
-        result.debugInfo.url      = request.url;
-        result.debugInfo.bodyLen  = pageText.length;
-        result.debugInfo.bodySnip = pageText.substring(0, 500);
+        // ── PAGE 1: Search results list ───────────────────────────────────────
+        let pageText = (await page.textContent('body')) || '';
+        log.info(`Page 1 preview: ${pageText.substring(0, 300)}`);
 
-        log.info(`Page length: ${pageText.length}`);
-        log.info(`Preview: ${pageText.substring(0, 400)}`);
-
-        // ── No results ────────────────────────────────────────────────────────
         const noRecord =
             /no record/i.test(pageText) ||
             /not found/i.test(pageText) ||
-            /0 records/i.test(pageText) ||
-            /no inmates/i.test(pageText);
+            /0 records/i.test(pageText);
 
         if (noRecord) {
             log.info('No inmate record found.');
@@ -100,62 +102,98 @@ const crawler = new PlaywrightCrawler({
 
         result.found = true;
 
-        // ── STEP 1: If name search results list — click first name link ───────
+        // ── Log ALL links on page 1 ───────────────────────────────────────────
+        const page1Links = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('a')).map(a => ({
+                text: a.innerText?.trim(),
+                href: a.href,
+            }))
+        );
+        log.info(`Page 1 links: ${JSON.stringify(page1Links)}`);
+
+        // ── STEP 1: Click first inmate name in results list ───────────────────
         const isResultsList = /Last.*Known.*Booking|Previous.*Booking/i.test(pageText);
         if (isResultsList) {
-            log.info('Results list detected — clicking first inmate name link …');
-            // Click the first inmate name link in the results table
-            const nameLink = page.locator('table a').first();
+            log.info('On results list — clicking first inmate name …');
+            const nameLink = page.locator('table tbody tr td a').first();
             if ((await nameLink.count()) > 0) {
-                try {
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                        nameLink.click(),
-                    ]);
-                    await sleep(3000);
-                    log.info(`Navigated to: ${page.url()}`);
-                } catch (e) {
-                    log.warning(`Name link click failed: ${e.message}`);
+                await clickAndWait(page, nameLink, log, 'inmate name');
+            } else {
+                // fallback: click any table link
+                const anyLink = page.locator('table a').first();
+                if ((await anyLink.count()) > 0) {
+                    await clickAndWait(page, anyLink, log, 'table link fallback');
                 }
             }
         }
 
-        // ── STEP 2: Now on inmate summary page — click "Last Known Booking" ───
-        const pageText2 = (await page.textContent('body')) || '';
-        const hasBookingLink = /Last.*Known.*Booking/i.test(pageText2);
+        // ── PAGE 2: Inmate summary — log all links ────────────────────────────
+        pageText = (await page.textContent('body')) || '';
+        log.info(`Page 2 preview: ${pageText.substring(0, 300)}`);
 
-        if (hasBookingLink) {
-            log.info('Inmate summary page detected — clicking Last Known Booking …');
-            try {
-                // Find the "Last Known Booking" link
-                const bookingLink = page.locator('a:has-text("Last"), a:has-text("Booking"), td a').first();
-                if ((await bookingLink.count()) > 0) {
-                    await Promise.all([
-                        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                        bookingLink.click(),
-                    ]);
-                    await sleep(3000);
-                    log.info(`Navigated to booking detail: ${page.url()}`);
-                } else {
-                    // Try clicking any link in the page that leads to booking detail
-                    const allLinks = await page.locator('a[href*="booking"], a[href*="detail"], a[href*="inquiry"]').all();
-                    log.info(`Found ${allLinks.length} potential booking links`);
-                    if (allLinks.length > 0) {
-                        await Promise.all([
-                            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                            allLinks[0].click(),
-                        ]);
-                        await sleep(3000);
+        const page2Links = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('a')).map(a => ({
+                text: a.innerText?.trim(),
+                href: a.href,
+            }))
+        );
+        log.info(`Page 2 links: ${JSON.stringify(page2Links)}`);
+
+        // ── STEP 2: Click "Last Known Booking" link ───────────────────────────
+        const hasSummary = /Last.*Known.*Booking/i.test(pageText);
+        if (hasSummary) {
+            log.info('On inmate summary — clicking Last Known Booking …');
+
+            // Try multiple selectors to find the booking link
+            const selectors = [
+                'a:text("Last Known Booking")',
+                'a:text("Last")',
+                'td:has-text("Last Known Booking") a',
+                'table a[href*="booking"]',
+                'table a[href*="detail"]',
+                'table td:nth-child(9) a',  // Last Known Booking is 9th column
+                'table td:nth-child(10) a', // or 10th
+            ];
+
+            let clicked = false;
+            for (const sel of selectors) {
+                try {
+                    const el = page.locator(sel).first();
+                    if ((await el.count()) > 0) {
+                        log.info(`Found booking link with selector: ${sel}`);
+                        await clickAndWait(page, el, log, `booking link [${sel}]`);
+                        clicked = true;
+                        break;
+                    }
+                } catch (e) {
+                    log.info(`Selector ${sel} failed: ${e.message}`);
+                }
+            }
+
+            if (!clicked) {
+                // Last resort: get all links and click the one containing "Last"
+                const allLinks = await page.locator('a').all();
+                for (const link of allLinks) {
+                    const txt = (await link.textContent() || '').trim();
+                    log.info(`Checking link text: "${txt}"`);
+                    if (/last/i.test(txt) || /booking/i.test(txt)) {
+                        log.info(`Clicking link: "${txt}"`);
+                        await clickAndWait(page, link, log, txt);
+                        clicked = true;
+                        break;
                     }
                 }
-            } catch (e) {
-                log.warning(`Booking link click failed: ${e.message}`);
+            }
+
+            if (!clicked) {
+                log.warning('Could not find Last Known Booking link — scraping current page');
             }
         }
 
-        // ── STEP 3: Scrape the final detail page ──────────────────────────────
-        const finalText = (await page.textContent('body')) || '';
-        log.info(`Final page preview: ${finalText.substring(0, 400)}`);
+        // ── PAGE 3: Booking detail — scrape everything ────────────────────────
+        pageText = (await page.textContent('body')) || '';
+        log.info(`Final page preview: ${pageText.substring(0, 400)}`);
+        log.info(`Final URL: ${page.url()}`);
 
         result.gotDetailPage = true;
 
@@ -171,25 +209,14 @@ const crawler = new PlaywrightCrawler({
             return rows;
         });
 
-        // ── Also capture all links on final page for debugging ────────────────
-        const allLinks = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('a')).map(a => ({
-                text : a.innerText?.trim(),
-                href : a.href,
-            }))
-        );
-
-        const fullText = await page.evaluate(() => document.body.innerText);
-
-        result.pageData.allRows   = allRows;
-        result.pageData.fullText  = fullText;
+        const fullText          = await page.evaluate(() => document.body.innerText);
+        result.pageData.allRows = allRows;
+        result.pageData.fullText = fullText;
         result.debugInfo.rowCount = allRows.length;
-        result.debugInfo.allLinks = allLinks;
         result.debugInfo.finalUrl = page.url();
 
-        log.info(`✅ Scraped ${allRows.length} rows from final page.`);
-        log.info(`Final URL: ${page.url()}`);
-        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 5))}`);
+        log.info(`✅ Scraped ${allRows.length} rows.`);
+        log.info(`All rows: ${JSON.stringify(allRows)}`);
     },
 
     failedRequestHandler({ request, error, log }) {
