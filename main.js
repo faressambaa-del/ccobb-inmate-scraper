@@ -15,7 +15,6 @@ const {
     proxyList     = [],
 } = input || {};
 
-// ── Build proxy URL list from WebShare credentials ────────────────────────────
 const proxyUrls = proxyList.map(p => `http://${proxyUsername}:${proxyPassword}@${p}`);
 
 const INQUIRY_URL = [
@@ -26,11 +25,9 @@ const INQUIRY_URL = [
     `&qry=${encodeURIComponent(mode)}`,
 ].join('');
 
-console.log(`Searching  → name="${name}"  mode="${mode}"`);
-console.log(`Target URL → ${INQUIRY_URL}`);
-console.log(`Proxies loaded: ${proxyUrls.length}`);
+console.log(`Searching → name="${name}"  mode="${mode}"`);
+console.log(`URL: ${INQUIRY_URL}`);
 
-// ── Result container ──────────────────────────────────────────────────────────
 let result = {
     found         : false,
     name,
@@ -41,12 +38,10 @@ let result = {
     debugInfo     : {},
 };
 
-// ── Proxy configuration — correct Crawlee way ─────────────────────────────────
 const proxyConfiguration = proxyUrls.length > 0
     ? new ProxyConfiguration({ proxyUrls })
     : undefined;
 
-// ── Crawler ───────────────────────────────────────────────────────────────────
 const crawler = new PlaywrightCrawler({
 
     ...(proxyConfiguration ? { proxyConfiguration } : {}),
@@ -54,7 +49,7 @@ const crawler = new PlaywrightCrawler({
     launchContext: {
         launchOptions: {
             headless : true,
-            args     : [
+            args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
@@ -83,15 +78,14 @@ const crawler = new PlaywrightCrawler({
         await sleep(3000);
 
         const pageText = (await page.textContent('body')) || '';
-
         result.debugInfo.url      = request.url;
         result.debugInfo.bodyLen  = pageText.length;
         result.debugInfo.bodySnip = pageText.substring(0, 500);
 
-        log.info(`Page loaded. Length: ${pageText.length}`);
-        log.info(`Preview: ${pageText.substring(0, 300)}`);
+        log.info(`Page length: ${pageText.length}`);
+        log.info(`Preview: ${pageText.substring(0, 400)}`);
 
-        // ── No results check ──────────────────────────────────────────────────
+        // ── No results ────────────────────────────────────────────────────────
         const noRecord =
             /no record/i.test(pageText) ||
             /not found/i.test(pageText) ||
@@ -104,34 +98,66 @@ const crawler = new PlaywrightCrawler({
             return;
         }
 
-        // ── Detect if already on detail page ──────────────────────────────────
-        const isDetailPage =
-            /Agency ID/i.test(pageText) ||
-            /Offense/i.test(pageText)   ||
-            /Bond/i.test(pageText);
+        result.found = true;
 
-        // ── If results list, click first inmate link ──────────────────────────
-        if (!isDetailPage) {
-            const firstLink = page.locator('a[href*="inquiry.asp"], table a').first();
-            const hasLinks  = (await firstLink.count()) > 0;
-
-            if (hasLinks) {
-                log.info('Result list detected – clicking first inmate link …');
+        // ── STEP 1: If name search results list — click first name link ───────
+        const isResultsList = /Last.*Known.*Booking|Previous.*Booking/i.test(pageText);
+        if (isResultsList) {
+            log.info('Results list detected — clicking first inmate name link …');
+            // Click the first inmate name link in the results table
+            const nameLink = page.locator('table a').first();
+            if ((await nameLink.count()) > 0) {
                 try {
                     await Promise.all([
                         page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                        firstLink.click(),
+                        nameLink.click(),
                     ]);
                     await sleep(3000);
+                    log.info(`Navigated to: ${page.url()}`);
                 } catch (e) {
-                    log.warning(`Click navigation failed: ${e.message}`);
+                    log.warning(`Name link click failed: ${e.message}`);
                 }
             }
         }
 
-        // ── Scrape all table rows ─────────────────────────────────────────────
+        // ── STEP 2: Now on inmate summary page — click "Last Known Booking" ───
+        const pageText2 = (await page.textContent('body')) || '';
+        const hasBookingLink = /Last.*Known.*Booking/i.test(pageText2);
+
+        if (hasBookingLink) {
+            log.info('Inmate summary page detected — clicking Last Known Booking …');
+            try {
+                // Find the "Last Known Booking" link
+                const bookingLink = page.locator('a:has-text("Last"), a:has-text("Booking"), td a').first();
+                if ((await bookingLink.count()) > 0) {
+                    await Promise.all([
+                        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
+                        bookingLink.click(),
+                    ]);
+                    await sleep(3000);
+                    log.info(`Navigated to booking detail: ${page.url()}`);
+                } else {
+                    // Try clicking any link in the page that leads to booking detail
+                    const allLinks = await page.locator('a[href*="booking"], a[href*="detail"], a[href*="inquiry"]').all();
+                    log.info(`Found ${allLinks.length} potential booking links`);
+                    if (allLinks.length > 0) {
+                        await Promise.all([
+                            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
+                            allLinks[0].click(),
+                        ]);
+                        await sleep(3000);
+                    }
+                }
+            } catch (e) {
+                log.warning(`Booking link click failed: ${e.message}`);
+            }
+        }
+
+        // ── STEP 3: Scrape the final detail page ──────────────────────────────
+        const finalText = (await page.textContent('body')) || '';
+        log.info(`Final page preview: ${finalText.substring(0, 400)}`);
+
         result.gotDetailPage = true;
-        result.found         = true;
 
         const allRows = await page.evaluate(() => {
             const rows = [];
@@ -145,24 +171,33 @@ const crawler = new PlaywrightCrawler({
             return rows;
         });
 
+        // ── Also capture all links on final page for debugging ────────────────
+        const allLinks = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('a')).map(a => ({
+                text : a.innerText?.trim(),
+                href : a.href,
+            }))
+        );
+
         const fullText = await page.evaluate(() => document.body.innerText);
 
         result.pageData.allRows   = allRows;
         result.pageData.fullText  = fullText;
         result.debugInfo.rowCount = allRows.length;
+        result.debugInfo.allLinks = allLinks;
+        result.debugInfo.finalUrl = page.url();
 
-        log.info(`✅ Scraped ${allRows.length} rows.`);
-        log.info(`Sample: ${JSON.stringify(allRows.slice(0, 3))}`);
+        log.info(`✅ Scraped ${allRows.length} rows from final page.`);
+        log.info(`Final URL: ${page.url()}`);
+        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 5))}`);
     },
 
     failedRequestHandler({ request, error, log }) {
-        log.error(`Request failed: ${request.url} — ${error?.message}`);
-        result.debugInfo.error   = error?.message || 'Unknown error';
-        result.debugInfo.failUrl = request.url;
+        log.error(`Failed: ${request.url} — ${error?.message}`);
+        result.debugInfo.error = error?.message;
     },
 });
 
-// ── Run ───────────────────────────────────────────────────────────────────────
 await crawler.run([{ url: INQUIRY_URL }]);
 
 await Actor.pushData(result);
