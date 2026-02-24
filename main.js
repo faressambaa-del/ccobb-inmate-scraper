@@ -1,5 +1,5 @@
 import { Actor } from 'apify';
-import { PlaywrightCrawler, sleep } from 'crawlee';
+import { PlaywrightCrawler, ProxyConfiguration, sleep } from 'crawlee';
 
 await Actor.init();
 
@@ -15,14 +15,8 @@ const {
     proxyList     = [],
 } = input || {};
 
-// ── Pick a random proxy ───────────────────────────────────────────────────────
-function getRandomProxy() {
-    if (!proxyList || proxyList.length === 0) return null;
-    const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
-    return proxy; // returns "ip:port"
-}
-
-const selectedProxyHost = getRandomProxy();
+// ── Build proxy URL list from WebShare credentials ────────────────────────────
+const proxyUrls = proxyList.map(p => `http://${proxyUsername}:${proxyPassword}@${p}`);
 
 const INQUIRY_URL = [
     'http://inmate-search.cobbsheriff.org/inquiry.asp',
@@ -34,7 +28,7 @@ const INQUIRY_URL = [
 
 console.log(`Searching  → name="${name}"  mode="${mode}"`);
 console.log(`Target URL → ${INQUIRY_URL}`);
-console.log(`Proxy selected: ${selectedProxyHost || 'none'}`);
+console.log(`Proxies loaded: ${proxyUrls.length}`);
 
 // ── Result container ──────────────────────────────────────────────────────────
 let result = {
@@ -47,8 +41,15 @@ let result = {
     debugInfo     : {},
 };
 
-// ── Crawler — proxy auth passed via launchOptions correctly ───────────────────
+// ── Proxy configuration — correct Crawlee way ─────────────────────────────────
+const proxyConfiguration = proxyUrls.length > 0
+    ? new ProxyConfiguration({ proxyUrls })
+    : undefined;
+
+// ── Crawler ───────────────────────────────────────────────────────────────────
 const crawler = new PlaywrightCrawler({
+
+    ...(proxyConfiguration ? { proxyConfiguration } : {}),
 
     launchContext: {
         launchOptions: {
@@ -58,19 +59,9 @@ const crawler = new PlaywrightCrawler({
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                // ✅ Correct way to set proxy in Playwright
-                ...(selectedProxyHost ? [`--proxy-server=http://${selectedProxyHost}`] : []),
             ],
         },
-        // ✅ Correct way to pass proxy credentials in Crawlee/Playwright
-        ...(selectedProxyHost && proxyUsername ? {
-            proxyUrl: `http://${proxyUsername}:${proxyPassword}@${selectedProxyHost}`,
-        } : {}),
     },
-
-    requestHandlerTimeoutSecs : 180,
-    navigationTimeoutSecs     : 60,
-    maxRequestRetries         : 2,
 
     preNavigationHooks: [
         async ({ page }) => {
@@ -80,6 +71,10 @@ const crawler = new PlaywrightCrawler({
             });
         },
     ],
+
+    requestHandlerTimeoutSecs : 180,
+    navigationTimeoutSecs     : 60,
+    maxRequestRetries         : 2,
 
     async requestHandler({ page, request, log }) {
         log.info(`Processing: ${request.url}`);
@@ -152,12 +147,12 @@ const crawler = new PlaywrightCrawler({
 
         const fullText = await page.evaluate(() => document.body.innerText);
 
-        result.pageData.allRows  = allRows;
-        result.pageData.fullText = fullText;
+        result.pageData.allRows   = allRows;
+        result.pageData.fullText  = fullText;
         result.debugInfo.rowCount = allRows.length;
 
         log.info(`✅ Scraped ${allRows.length} rows.`);
-        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 3))}`);
+        log.info(`Sample: ${JSON.stringify(allRows.slice(0, 3))}`);
     },
 
     failedRequestHandler({ request, error, log }) {
