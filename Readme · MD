@@ -1,0 +1,61 @@
+# Cobb County Jail Inquiry Scraper
+
+Apify actor that searches the Cobb County jail roster using **Inquiry mode** with **WebShare rotating proxies**.
+
+## Repo Structure
+
+```
+cobb-jail-scraper/
+├── .actor/
+│   └── actor.json       ← Apify actor config & input schema
+├── main.js              ← Main Playwright scraper code
+├── package.json         ← Node.js dependencies
+└── README.md
+```
+
+## How to Deploy on Apify
+
+1. Push this repo to GitHub (keep it **Private**)
+2. Go to [apify.com](https://apify.com) → **Actors** → **Create new**
+3. Choose **"Link to GitHub"**
+4. Select this repo
+5. Set main file to `main.js`
+6. Click **Build**
+
+## Input Parameters
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | ✅ | Inmate name in `Last First` format e.g. `Smith John` |
+| `mode` | ✅ | `Inquiry` or `In Custody` |
+| `proxyUsername` | ✅ | WebShare proxy username |
+| `proxyPassword` | ✅ | WebShare proxy password |
+| `proxyList` | ✅ | Array of proxy IPs e.g. `["12.34.56.78:8080"]` |
+| `soid` | ❌ | SOID number (faster lookup) |
+| `serial` | ❌ | Serial number |
+
+## Example Input
+
+```json
+{
+  "name": "Smith John",
+  "mode": "Inquiry",
+  "proxyUsername": "your_webshare_username",
+  "proxyPassword": "your_webshare_password",
+  "proxyList": [
+    "12.34.56.78:8080",
+    "23.45.67.89:8080",
+    "34.56.78.90:8080"
+  ]
+}
+```
+
+## n8n Integration
+
+Use this URL in your n8n HTTP Request node:
+
+```
+https://api.apify.com/v2/acts/YOUR_USERNAME~cobb-county-jail-inquiry-scraper/run-sync-get-dataset-items?token=YOUR_APIFY_TOKEN
+```
+
+Pass the input as the POST body (JSON).
