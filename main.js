@@ -6,16 +6,16 @@ await Actor.init();
 // ── Input ────────────────────────────────────────────────────────────────────
 const input = await Actor.getInput();
 const {
-    name          = '',         // "Last First"  e.g. "Smith John"
-    soid          = '',         // optional SOID for faster lookup
-    serial        = '',         // optional serial number
-    mode          = 'Inquiry',  // "Inquiry" or "In Custody"
-    proxyUsername = '',         // WebShare proxy username
-    proxyPassword = '',         // WebShare proxy password
-    proxyList     = [],         // e.g. ["12.34.56.78:8080", "23.45.67.89:8080"]
+    name          = '',
+    soid          = '',
+    serial        = '',
+    mode          = 'Inquiry',
+    proxyUsername = '',
+    proxyPassword = '',
+    proxyList     = [],
 } = input || {};
 
-// ── Pick a random proxy from the WebShare list on each run ───────────────────
+// ── Pick a random US proxy from WebShare list ─────────────────────────────────
 function getRandomProxy() {
     if (!proxyList || proxyList.length === 0) return null;
     const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
@@ -32,11 +32,11 @@ const INQUIRY_URL = [
     `&qry=${encodeURIComponent(mode)}`,
 ].join('');
 
-console.log(`Searching  → name="${name}"  soid="${soid}"  mode="${mode}"`);
+console.log(`Searching  → name="${name}"  mode="${mode}"`);
 console.log(`Target URL → ${INQUIRY_URL}`);
-console.log(`Proxies available: ${proxyList.length}  |  Selected: ${selectedProxy ? selectedProxy.split('@')[1] : 'none (no proxy)'}`);
+console.log(`Proxy selected: ${selectedProxy ? selectedProxy.split('@')[1] : 'none'}`);
 
-// ── Result container ─────────────────────────────────────────────────────────
+// ── Result container ──────────────────────────────────────────────────────────
 let result = {
     found         : false,
     name,
@@ -47,7 +47,12 @@ let result = {
     debugInfo     : {},
 };
 
-// ── Crawler ──────────────────────────────────────────────────────────────────
+// ── Build launch args ─────────────────────────────────────────────────────────
+const proxyArgs = selectedProxy
+    ? [`--proxy-server=${new URL(selectedProxy).host}`]
+    : [];
+
+// ── Crawler ───────────────────────────────────────────────────────────────────
 const crawler = new PlaywrightCrawler({
 
     launchContext: {
@@ -56,15 +61,13 @@ const crawler = new PlaywrightCrawler({
             args     : [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                // Route all browser traffic through the selected WebShare proxy
-                ...(selectedProxy
-                    ? [`--proxy-server=${new URL(selectedProxy).host}`]
-                    : []),
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                ...proxyArgs,
             ],
         },
     },
 
-    // ── Authenticate proxy before every navigation ────────────────────────────
     preNavigationHooks: [
         async ({ page }) => {
             if (selectedProxy) {
@@ -74,23 +77,36 @@ const crawler = new PlaywrightCrawler({
                     password : decodeURIComponent(u.password),
                 });
             }
+            // Set realistic browser headers to avoid blocks
+            await page.setExtraHTTPHeaders({
+                'User-Agent'      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language' : 'en-US,en;q=0.9',
+            });
         },
     ],
 
-    requestHandlerTimeoutSecs : 120,
-    maxRequestRetries         : 3,
+    requestHandlerTimeoutSecs : 180,
+    navigationTimeoutSecs     : 60,
+    maxRequestRetries         : 2,
 
     async requestHandler({ page, request, log }) {
         log.info(`Processing: ${request.url}`);
 
-        await page.waitForSelector('body', { timeout: 30000 });
-        await sleep(2000);
+        // Wait for page to load
+        await page.waitForSelector('body', { timeout: 45000 });
+        await sleep(3000);
 
         const pageText = (await page.textContent('body')) || '';
-        result.debugInfo.url     = request.url;
-        result.debugInfo.bodyLen = pageText.length;
+        const pageHTML = await page.content();
 
-        // ── No results check ─────────────────────────────────────────────────
+        result.debugInfo.url      = request.url;
+        result.debugInfo.bodyLen  = pageText.length;
+        result.debugInfo.bodySnip = pageText.substring(0, 300);
+
+        log.info(`Page loaded. Body length: ${pageText.length}`);
+        log.info(`Body preview: ${pageText.substring(0, 200)}`);
+
+        // ── No results check ──────────────────────────────────────────────────
         const noRecord =
             /no record/i.test(pageText)  ||
             /not found/i.test(pageText)  ||
@@ -98,25 +114,36 @@ const crawler = new PlaywrightCrawler({
             /no inmates/i.test(pageText);
 
         if (noRecord) {
-            log.info('No inmate record found.');
+            log.info('No inmate record found for this name.');
             result.found = false;
             return;
         }
 
-        // ── If a result list appears, click the first inmate link ─────────────
-        const firstLink = page.locator('a[href*="inquiry.asp"]').first();
+        // ── Check if we landed directly on detail page ────────────────────────
+        const isDetailPage =
+            /Agency ID/i.test(pageText)  ||
+            /booking/i.test(pageText)    ||
+            /SOID/i.test(pageText)       ||
+            /Offense/i.test(pageText);
+
+        // ── If results list, click first inmate link ──────────────────────────
+        const firstLink = page.locator('a[href*="inquiry.asp"], a[href*="detail"], table a').first();
         const hasLinks  = (await firstLink.count()) > 0;
 
-        if (hasLinks) {
+        if (hasLinks && !isDetailPage) {
             log.info('Result list detected – clicking first inmate link …');
-            await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
-                firstLink.click(),
-            ]);
-            await sleep(2000);
+            try {
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }),
+                    firstLink.click(),
+                ]);
+                await sleep(3000);
+            } catch (e) {
+                log.warning(`Navigation after click failed: ${e.message}`);
+            }
         }
 
-        // ── Scrape all table rows from the detail page ────────────────────────
+        // ── Scrape ALL table rows ─────────────────────────────────────────────
         result.gotDetailPage = true;
         result.found         = true;
 
@@ -132,22 +159,32 @@ const crawler = new PlaywrightCrawler({
             return rows;
         });
 
-        result.pageData.allRows   = allRows;
+        // ── Also grab full page text as backup ────────────────────────────────
+        const fullText = await page.evaluate(() => document.body.innerText);
+
+        result.pageData.allRows  = allRows;
+        result.pageData.fullText = fullText;
         result.debugInfo.rowCount = allRows.length;
-        log.info(`Scraped ${allRows.length} rows from detail page.`);
+
+        log.info(`✅ Scraped ${allRows.length} rows from detail page.`);
+        log.info(`First few rows: ${JSON.stringify(allRows.slice(0, 3))}`);
     },
 
-    failedRequestHandler({ request, log }) {
-        log.error(`Request failed after retries: ${request.url}`);
-        result.debugInfo.error = `Failed: ${request.url}`;
+    failedRequestHandler({ request, error, log }) {
+        log.error(`Request failed: ${request.url} — ${error?.message}`);
+        result.debugInfo.error   = error?.message || 'Unknown error';
+        result.debugInfo.failUrl = request.url;
     },
 });
 
 // ── Run ───────────────────────────────────────────────────────────────────────
 await crawler.run([{ url: INQUIRY_URL }]);
 
-// ── Push result to Apify dataset — n8n reads this via Apify API ──────────────
+// ── Push to Apify dataset ─────────────────────────────────────────────────────
 await Actor.pushData(result);
-console.log('Done. found =', result.found);
+console.log('Done. found =', result.found, '| gotDetailPage =', result.gotDetailPage);
+if (result.debugInfo.error) {
+    console.log('Error details:', result.debugInfo.error);
+}
 
 await Actor.exit();
