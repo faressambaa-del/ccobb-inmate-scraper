@@ -25,7 +25,6 @@ const INQUIRY_URL = [
 ].join('');
 
 console.log(`Searching → name="${name}"  mode="${mode}"`);
-console.log(`URL: ${INQUIRY_URL}`);
 
 let result = {
     found         : false,
@@ -79,12 +78,7 @@ const crawler = new PlaywrightCrawler({
         let pageText = (await page.textContent('body')) || '';
 
         // ── No results ────────────────────────────────────────────────────────
-        const noRecord =
-            /no record/i.test(pageText) ||
-            /not found/i.test(pageText) ||
-            /0 records/i.test(pageText);
-
-        if (noRecord) {
+        if (/no record/i.test(pageText) || /not found/i.test(pageText)) {
             log.info('No inmate record found.');
             result.found = false;
             return;
@@ -92,71 +86,100 @@ const crawler = new PlaywrightCrawler({
 
         result.found = true;
 
-        // ── Extract ALL links from current page ───────────────────────────────
+        // ── Dump full HTML so we can see exact link structure ─────────────────
+        const fullHTML = await page.content();
+        log.info(`PAGE HTML: ${fullHTML.substring(0, 3000)}`);
+
+        // ── Get all links with full details ───────────────────────────────────
         const allLinks = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('a')).map(a => ({
-                text : a.innerText?.trim().replace(/\n/g, ' '),
-                href : a.href,
+            Array.from(document.querySelectorAll('a')).map((a, i) => ({
+                index    : i,
+                text     : a.innerText?.trim().replace(/\s+/g, ' '),
+                href     : a.href,
+                onclick  : a.getAttribute('onclick'),
+                id       : a.id,
+                className: a.className,
             }))
         );
-        log.info(`All links on page: ${JSON.stringify(allLinks)}`);
+        log.info(`ALL LINKS: ${JSON.stringify(allLinks)}`);
 
-        // ── Find "Last Known Booking" link directly by href pattern ───────────
-        const bookingLink = allLinks.find(l =>
+        // ── Try to find and navigate to InmDetails page ───────────────────────
+        // Check if InmDetails link exists anywhere on page
+        const detailLink = allLinks.find(l =>
             /InmDetails/i.test(l.href) ||
+            /InmDetails/i.test(l.onclick || '') ||
             /BOOKING_ID/i.test(l.href) ||
-            /last/i.test(l.text) ||
-            /booking/i.test(l.text)
+            /BOOKING_ID/i.test(l.onclick || '')
         );
 
-        if (bookingLink && bookingLink.href) {
-            log.info(`Found booking link: ${bookingLink.href}`);
-            // Navigate directly to the detail page URL
-            await page.goto(bookingLink.href, { waitUntil: 'networkidle', timeout: 90000 });
-            await sleep(3000);
-            log.info(`Navigated to: ${page.url()}`);
-        } else {
-            log.warning('No booking detail link found — checking if already on results list');
+        if (detailLink) {
+            log.info(`Found direct detail link: ${JSON.stringify(detailLink)}`);
 
-            // Try to find the inmate row link first (name link)
-            const inmateLink = allLinks.find(l =>
-                /inquiry/i.test(l.href) && l.href !== request.url
+            if (detailLink.href && !detailLink.href.endsWith('#')) {
+                await page.goto(detailLink.href, { waitUntil: 'networkidle', timeout: 90000 });
+            } else if (detailLink.onclick) {
+                // Execute the onclick directly
+                await page.evaluate((idx) => {
+                    document.querySelectorAll('a')[idx].click();
+                }, detailLink.index);
+                await page.waitForLoadState('networkidle', { timeout: 60000 });
+            }
+            await sleep(3000);
+            log.info(`After detail nav → URL: ${page.url()}`);
+
+        } else {
+            // ── Not on detail yet — find "Last Known Booking" cell and click it
+            log.info('No direct detail link — searching for Last Known Booking cell …');
+
+            // Get all table cells with their text and any links inside
+            const tableCells = await page.evaluate(() => {
+                const cells = [];
+                document.querySelectorAll('td').forEach((td, i) => {
+                    const a = td.querySelector('a');
+                    cells.push({
+                        index    : i,
+                        text     : td.innerText?.trim().replace(/\s+/g, ' '),
+                        hasLink  : !!a,
+                        linkHref : a?.href || '',
+                        linkText : a?.innerText?.trim() || '',
+                        onclick  : td.getAttribute('onclick') || (a?.getAttribute('onclick') || ''),
+                    });
+                });
+                return cells;
+            });
+            log.info(`TABLE CELLS: ${JSON.stringify(tableCells)}`);
+
+            // Find cell containing "Last Known Booking"
+            const lastBookingCell = tableCells.find(c =>
+                /last.*known/i.test(c.text) || /last.*booking/i.test(c.text)
             );
 
-            if (inmateLink && inmateLink.href) {
-                log.info(`Navigating to inmate page: ${inmateLink.href}`);
-                await page.goto(inmateLink.href, { waitUntil: 'networkidle', timeout: 90000 });
-                await sleep(3000);
+            if (lastBookingCell) {
+                log.info(`Found Last Known Booking cell: ${JSON.stringify(lastBookingCell)}`);
 
-                // Now get links from inmate summary page
-                const summaryLinks = await page.evaluate(() =>
-                    Array.from(document.querySelectorAll('a')).map(a => ({
-                        text : a.innerText?.trim().replace(/\n/g, ' '),
-                        href : a.href,
-                    }))
-                );
-                log.info(`Inmate summary links: ${JSON.stringify(summaryLinks)}`);
-
-                const detailLink = summaryLinks.find(l =>
-                    /InmDetails/i.test(l.href) ||
-                    /BOOKING_ID/i.test(l.href) ||
-                    /last/i.test(l.text) ||
-                    /booking/i.test(l.text)
-                );
-
-                if (detailLink && detailLink.href) {
-                    log.info(`Found detail link: ${detailLink.href}`);
-                    await page.goto(detailLink.href, { waitUntil: 'networkidle', timeout: 90000 });
-                    await sleep(3000);
-                    log.info(`Navigated to detail: ${page.url()}`);
+                if (lastBookingCell.linkHref && !lastBookingCell.linkHref.endsWith('#')) {
+                    await page.goto(lastBookingCell.linkHref, { waitUntil: 'networkidle', timeout: 90000 });
+                } else {
+                    // Click the td cell directly at its index
+                    await page.evaluate((idx) => {
+                        const tds = document.querySelectorAll('td');
+                        const td  = tds[idx];
+                        const a   = td.querySelector('a');
+                        if (a) a.click();
+                        else td.click();
+                    }, lastBookingCell.index);
+                    await page.waitForLoadState('networkidle', { timeout: 60000 });
                 }
+                await sleep(3000);
+                log.info(`After booking click → URL: ${page.url()}`);
+            } else {
+                log.warning('Could not find Last Known Booking cell');
             }
         }
 
         // ── Scrape final detail page ───────────────────────────────────────────
-        const finalText = (await page.textContent('body')) || '';
-        log.info(`Final URL: ${page.url()}`);
-        log.info(`Final page preview: ${finalText.substring(0, 500)}`);
+        const finalHTML = await page.content();
+        log.info(`FINAL HTML: ${finalHTML.substring(0, 2000)}`);
 
         result.gotDetailPage = true;
 
@@ -177,8 +200,9 @@ const crawler = new PlaywrightCrawler({
         result.pageData.fullText = fullText;
         result.debugInfo.rowCount = allRows.length;
         result.debugInfo.finalUrl = page.url();
+        result.debugInfo.allLinks = allLinks;
 
-        log.info(`✅ Scraped ${allRows.length} rows.`);
+        log.info(`✅ Scraped ${allRows.length} rows from: ${page.url()}`);
         log.info(`All rows: ${JSON.stringify(allRows)}`);
     },
 
