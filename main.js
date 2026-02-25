@@ -85,36 +85,64 @@ const crawler = new PlaywrightCrawler({
 
         result.found = true;
 
-        // ── Extract URL from button onclick attribute ─────────────────────────
-        // The button HTML is: onclick="javascript:sh("InmDetails.asp?soid=...&BOOKING_ID=...", "_New");"
-        const detailUrl = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
-            for (const btn of buttons) {
-                const onclick = btn.getAttribute('onclick') || '';
-                // Match the URL inside sh("URL", ...)
-                const match = onclick.match(/sh\("([^"]+InmDetails[^"]+)"/);
-                if (match) return match[1];
-            }
-            return null;
+        // ── Override window.open to intercept the popup URL ───────────────────
+        // The sh() function calls window.open(url, ...) — we capture that URL
+        // instead of letting it open a new window
+        let capturedUrl = await page.evaluate(() => {
+            return new Promise((resolve) => {
+                // Override window.open to capture the URL
+                const original = window.open;
+                window.open = (url) => {
+                    resolve(url);
+                    return null;
+                };
+
+                // Find the Last Known Booking button and click it
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const bookingBtn = buttons.find(b =>
+                    /last/i.test(b.innerText) || /booking/i.test(b.innerText)
+                );
+
+                if (bookingBtn) {
+                    bookingBtn.click();
+                } else {
+                    resolve(null);
+                }
+
+                // Timeout fallback
+                setTimeout(() => resolve(null), 3000);
+            });
         });
 
-        log.info(`Extracted detail URL: ${detailUrl}`);
+        log.info(`Captured popup URL: ${capturedUrl}`);
 
-        if (detailUrl) {
-            // Navigate directly to the full detail URL
-            const fullDetailUrl = `http://inmate-search.cobbsheriff.org/${detailUrl}`;
-            log.info(`Navigating to: ${fullDetailUrl}`);
-            await page.goto(fullDetailUrl, { waitUntil: 'networkidle', timeout: 90000 });
+        // ── Also try extracting from raw HTML as backup ───────────────────────
+        if (!capturedUrl) {
+            const html = await page.content();
+            // Match InmDetails URL in raw HTML (handles &amp; encoding)
+            const match = html.match(/InmDetails\.asp\?[^"'<>]+/);
+            if (match) {
+                capturedUrl = match[0].replace(/&amp;/g, '&');
+                log.info(`Extracted from HTML: ${capturedUrl}`);
+            }
+        }
+
+        if (capturedUrl) {
+            const base = 'http://inmate-search.cobbsheriff.org/';
+            const fullUrl = capturedUrl.startsWith('http') ? capturedUrl : base + capturedUrl;
+            log.info(`Navigating to detail page: ${fullUrl}`);
+
+            await page.goto(fullUrl, { waitUntil: 'networkidle', timeout: 90000 });
             await sleep(3000);
             log.info(`Now on: ${page.url()}`);
         } else {
-            log.warning('Could not extract detail URL from button onclick');
+            log.warning('Could not find detail URL — scraping current page');
         }
 
-        // ── Scrape the detail page ────────────────────────────────────────────
+        // ── Scrape the full booking detail page ───────────────────────────────
         const finalText = (await page.textContent('body')) || '';
-        log.info(`Final page preview: ${finalText.substring(0, 500)}`);
         log.info(`Final URL: ${page.url()}`);
+        log.info(`Final preview: ${finalText.substring(0, 500)}`);
 
         result.gotDetailPage = true;
 
@@ -133,12 +161,12 @@ const crawler = new PlaywrightCrawler({
         const fullText           = await page.evaluate(() => document.body.innerText);
         result.pageData.allRows  = allRows;
         result.pageData.fullText = fullText;
-        result.debugInfo.rowCount = allRows.length;
-        result.debugInfo.finalUrl = page.url();
-        result.debugInfo.detailUrl = detailUrl;
+        result.debugInfo.rowCount  = allRows.length;
+        result.debugInfo.finalUrl  = page.url();
+        result.debugInfo.capturedUrl = capturedUrl;
 
         log.info(`✅ Scraped ${allRows.length} rows from: ${page.url()}`);
-        log.info(`All rows: ${JSON.stringify(allRows)}`);
+        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 5))}`);
     },
 
     failedRequestHandler({ request, error, log }) {
