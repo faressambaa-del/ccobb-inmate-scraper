@@ -43,17 +43,19 @@
       "proxyUsername": {
         "title": "Proxy Username",
         "type": "string",
+        "description": "Username for proxy authentication",
         "editor": "textfield"
       },
       "proxyPassword": {
         "title": "Proxy Password",
         "type": "string",
+        "description": "Password for proxy authentication",
         "editor": "textfield"
       },
       "proxyList": {
         "title": "Proxy List",
         "type": "array",
-        "description": "Array of proxy addresses host:port",
+        "description": "Array of proxy addresses in host:port format",
         "editor": "json"
       }
     },
