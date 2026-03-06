@@ -6,6 +6,7 @@ await Actor.init();
 const input = await Actor.getInput();
 const {
     name          = '',
+    names         = [],
     soid          = '',
     serial        = '',
     mode          = 'Inquiry',
@@ -14,39 +15,47 @@ const {
     proxyList     = [],
 } = input || {};
 
+const nameList = names.length > 0
+    ? names
+    : (name ? [{ name, original_name: name }] : []);
+
+if (nameList.length === 0) {
+    console.log('No names provided. Exiting.');
+    await Actor.exit();
+}
+
+console.log(`Batch mode: processing ${nameList.length} names in one run`);
+
 const proxyUrls = proxyList.map(p => `http://${proxyUsername}:${proxyPassword}@${p}`);
-
-const INQUIRY_URL = [
-    'http://inmate-search.cobbsheriff.org/inquiry.asp',
-    `?soid=${encodeURIComponent(soid)}`,
-    `&inmate_name=${encodeURIComponent(name)}`,
-    `&serial=${encodeURIComponent(serial)}`,
-    `&qry=${encodeURIComponent(mode)}`,
-].join('');
-
-console.log(`Searching → name="${name}"  mode="${mode}"`);
-
-let result = {
-    found         : false,
-    name,
-    mode,
-    scrapedAt     : new Date().toISOString(),
-    gotDetailPage : false,
-    pageData      : { allRows: [] },
-    debugInfo     : {},
-};
 
 const proxyConfiguration = proxyUrls.length > 0
     ? new ProxyConfiguration({ proxyUrls })
     : undefined;
 
+const requests = nameList.map(entry => {
+    const searchName   = typeof entry === 'string' ? entry : entry.name;
+    const originalName = typeof entry === 'string' ? entry : (entry.original_name || entry.name);
+
+    const url = [
+        'http://inmate-search.cobbsheriff.org/inquiry.asp',
+        `?soid=${encodeURIComponent(soid)}`,
+        `&inmate_name=${encodeURIComponent(searchName)}`,
+        `&serial=${encodeURIComponent(serial)}`,
+        `&qry=${encodeURIComponent(mode)}`,
+    ].join('');
+
+    return { url, userData: { searchName, originalName } };
+});
+
 const crawler = new PlaywrightCrawler({
 
     ...(proxyConfiguration ? { proxyConfiguration } : {}),
 
+    maxConcurrency: 3,
+
     launchContext: {
         launchOptions: {
-            headless : true,
+            headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -58,6 +67,14 @@ const crawler = new PlaywrightCrawler({
 
     preNavigationHooks: [
         async ({ page }) => {
+            await page.route('**/*', (route) => {
+                const type = route.request().resourceType();
+                if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+                    route.abort();
+                } else {
+                    route.continue();
+                }
+            });
             await page.setExtraHTTPHeaders({
                 'User-Agent'      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept-Language' : 'en-US,en;q=0.9',
@@ -70,79 +87,57 @@ const crawler = new PlaywrightCrawler({
     maxRequestRetries         : 2,
 
     async requestHandler({ page, request, log }) {
-        log.info(`Processing: ${request.url}`);
+        const { searchName, originalName } = request.userData;
+        log.info(`Processing: ${searchName}`);
+
+        let result = {
+            found         : false,
+            name          : searchName,
+            original_name : originalName,
+            mode,
+            scrapedAt     : new Date().toISOString(),
+            gotDetailPage : false,
+            pageData      : { allRows: [] },
+            debugInfo     : {},
+        };
 
         await page.waitForLoadState('networkidle', { timeout: 60000 });
-        await sleep(3000);
+        await sleep(1500);
 
         const pageText = (await page.textContent('body')) || '';
 
         if (/no record/i.test(pageText) || /not found/i.test(pageText)) {
-            log.info('No inmate record found.');
-            result.found = false;
+            log.info(`No record found for: ${searchName}`);
+            await Actor.pushData(result);
             return;
         }
 
         result.found = true;
 
-        // ── Override window.open to intercept the popup URL ───────────────────
-        // The sh() function calls window.open(url, ...) — we capture that URL
-        // instead of letting it open a new window
         let capturedUrl = await page.evaluate(() => {
             return new Promise((resolve) => {
-                // Override window.open to capture the URL
-                const original = window.open;
-                window.open = (url) => {
-                    resolve(url);
-                    return null;
-                };
-
-                // Find the Last Known Booking button and click it
+                window.open = (url) => { resolve(url); return null; };
                 const buttons = Array.from(document.querySelectorAll('button'));
                 const bookingBtn = buttons.find(b =>
                     /last/i.test(b.innerText) || /booking/i.test(b.innerText)
                 );
-
-                if (bookingBtn) {
-                    bookingBtn.click();
-                } else {
-                    resolve(null);
-                }
-
-                // Timeout fallback
+                if (bookingBtn) { bookingBtn.click(); } else { resolve(null); }
                 setTimeout(() => resolve(null), 3000);
             });
         });
 
-        log.info(`Captured popup URL: ${capturedUrl}`);
-
-        // ── Also try extracting from raw HTML as backup ───────────────────────
         if (!capturedUrl) {
-            const html = await page.content();
-            // Match InmDetails URL in raw HTML (handles &amp; encoding)
+            const html  = await page.content();
             const match = html.match(/InmDetails\.asp\?[^"'<>]+/);
-            if (match) {
-                capturedUrl = match[0].replace(/&amp;/g, '&');
-                log.info(`Extracted from HTML: ${capturedUrl}`);
-            }
+            if (match) capturedUrl = match[0].replace(/&amp;/g, '&');
         }
 
         if (capturedUrl) {
-            const base = 'http://inmate-search.cobbsheriff.org/';
+            const base    = 'http://inmate-search.cobbsheriff.org/';
             const fullUrl = capturedUrl.startsWith('http') ? capturedUrl : base + capturedUrl;
-            log.info(`Navigating to detail page: ${fullUrl}`);
-
             await page.goto(fullUrl, { waitUntil: 'networkidle', timeout: 90000 });
-            await sleep(3000);
-            log.info(`Now on: ${page.url()}`);
-        } else {
-            log.warning('Could not find detail URL — scraping current page');
+            await sleep(1500);
         }
-
-        // ── Scrape the full booking detail page ───────────────────────────────
-        const finalText = (await page.textContent('body')) || '';
-        log.info(`Final URL: ${page.url()}`);
-        log.info(`Final preview: ${finalText.substring(0, 500)}`);
 
         result.gotDetailPage = true;
 
@@ -158,27 +153,27 @@ const crawler = new PlaywrightCrawler({
             return rows;
         });
 
-        const fullText           = await page.evaluate(() => document.body.innerText);
-        result.pageData.allRows  = allRows;
-        result.pageData.fullText = fullText;
-        result.debugInfo.rowCount  = allRows.length;
-        result.debugInfo.finalUrl  = page.url();
-        result.debugInfo.capturedUrl = capturedUrl;
+        result.pageData.allRows   = allRows;
+        result.pageData.fullText  = await page.evaluate(() => document.body.innerText);
+        result.debugInfo.rowCount = allRows.length;
+        result.debugInfo.finalUrl = page.url();
 
-        log.info(`✅ Scraped ${allRows.length} rows from: ${page.url()}`);
-        log.info(`Sample rows: ${JSON.stringify(allRows.slice(0, 5))}`);
+        log.info(`✅ ${searchName} — ${allRows.length} rows scraped`);
+
+        await Actor.pushData(result);
     },
 
     failedRequestHandler({ request, error, log }) {
-        log.error(`Failed: ${request.url} — ${error?.message}`);
-        result.debugInfo.error = error?.message;
+        const { searchName, originalName } = request.userData;
+        log.error(`Failed: ${searchName} — ${error?.message}`);
+        Actor.pushData({
+            found: false, name: searchName, original_name: originalName,
+            scrapedAt: new Date().toISOString(), gotDetailPage: false,
+            pageData: { allRows: [] }, debugInfo: { error: error?.message },
+        });
     },
 });
 
-await crawler.run([{ url: INQUIRY_URL }]);
-
-await Actor.pushData(result);
-console.log('Done. found =', result.found, '| gotDetailPage =', result.gotDetailPage);
-if (result.debugInfo.error) console.log('Error:', result.debugInfo.error);
-
+await crawler.run(requests);
+console.log(`Done. Processed ${nameList.length} names.`);
 await Actor.exit();
