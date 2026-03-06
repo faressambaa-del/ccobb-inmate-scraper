@@ -52,7 +52,6 @@ const crawler = new PlaywrightCrawler({
 
     ...(proxyConfiguration ? { proxyConfiguration } : {}),
 
-    // Back to 1 — popup window handling breaks with parallel browsers
     maxConcurrency: 1,
 
     launchContext: {
@@ -76,7 +75,8 @@ const crawler = new PlaywrightCrawler({
         },
     ],
 
-    requestHandlerTimeoutSecs : 300,
+    // Increased to handle 10 names × ~45s each = ~450s needed
+    requestHandlerTimeoutSecs : 600,
     navigationTimeoutSecs     : 90,
     maxRequestRetries         : 2,
 
@@ -96,7 +96,7 @@ const crawler = new PlaywrightCrawler({
         };
 
         await page.waitForLoadState('networkidle', { timeout: 60000 });
-        await sleep(2000);
+        await sleep(1500);
 
         const pageText = (await page.textContent('body')) || '';
 
@@ -108,22 +108,47 @@ const crawler = new PlaywrightCrawler({
 
         result.found = true;
 
-        // Listen for popup BEFORE clicking — this is the correct approach
-        const popupPromise = page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null);
+        // Set up popup listener BEFORE clicking
+        const popupPromise = page.context().waitForEvent('page', { timeout: 12000 }).catch(() => null);
 
-        // Click the booking button
-        await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button, input[type=button]'));
-            const btn = buttons.find(b => /last|booking/i.test(b.innerText || b.value || ''));
-            if (btn) btn.click();
+        // Try clicking any clickable element in the results table
+        const clicked = await page.evaluate(() => {
+            // Try all possible button/link types in order of likelihood
+            const selectors = [
+                'input[type=button]',
+                'button',
+                'a[href*="InmDetails"]',
+                'td[onclick]',
+                'tr[onclick]',
+                '[onclick*="sh("]',
+                '[onclick*="InmDetails"]',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    el.click();
+                    return sel; // return which selector worked
+                }
+            }
+            // Last resort — click first table row with data
+            const rows = document.querySelectorAll('table tr');
+            for (const row of rows) {
+                if (row.querySelectorAll('td').length > 3) {
+                    row.click();
+                    return 'table row';
+                }
+            }
+            return null;
         });
+
+        log.info(`Clicked: ${clicked}`);
 
         const popup = await popupPromise;
 
         if (popup) {
             log.info(`Popup opened: ${popup.url()}`);
             await popup.waitForLoadState('networkidle', { timeout: 60000 });
-            await sleep(2000);
+            await sleep(1500);
 
             result.gotDetailPage = true;
 
@@ -143,13 +168,23 @@ const crawler = new PlaywrightCrawler({
             result.pageData.fullText  = await popup.evaluate(() => document.body.innerText);
             result.debugInfo.rowCount    = allRows.length;
             result.debugInfo.finalUrl    = popup.url();
+            result.debugInfo.clickedWith = clicked;
 
-            log.info(`✅ ${searchName} — ${allRows.length} rows from popup: ${popup.url()}`);
+            log.info(`✅ ${searchName} — ${allRows.length} rows from popup`);
             await popup.close();
 
         } else {
-            // Fallback — scrape current page
-            log.warning(`No popup for: ${searchName} — scraping current page`);
+            // Popup failed — try direct URL from HTML as last resort
+            log.warning(`No popup for: ${searchName} — trying HTML extraction`);
+            const html = await page.content();
+            const match = html.match(/InmDetails\.asp\?[^"'<>\s]+/i);
+            if (match) {
+                const detailUrl = 'http://inmate-search.cobbsheriff.org/' + match[0].replace(/&amp;/g, '&');
+                log.info(`Navigating directly to: ${detailUrl}`);
+                await page.goto(detailUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                await sleep(1500);
+                result.gotDetailPage = true;
+            }
 
             const allRows = await page.evaluate(() => {
                 const rows = [];
