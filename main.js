@@ -15,16 +15,19 @@ const {
     proxyList     = [],
 } = input || {};
 
+// Support both single name (old) and batch names array (new)
+// If names[] provided use it, otherwise fall back to single name
 const nameList = names.length > 0
     ? names
     : (name ? [{ name, original_name: name }] : []);
 
 if (nameList.length === 0) {
     console.log('No names provided. Exiting.');
+    await Actor.pushData({ found: false, error: 'No names provided' });
     await Actor.exit();
 }
 
-console.log(`Batch mode: processing ${nameList.length} names in one run`);
+console.log(`Processing ${nameList.length} names in one run`);
 
 const proxyUrls = proxyList.map(p => `http://${proxyUsername}:${proxyPassword}@${p}`);
 
@@ -159,7 +162,6 @@ const crawler = new PlaywrightCrawler({
         result.debugInfo.finalUrl = page.url();
 
         log.info(`✅ ${searchName} — ${allRows.length} rows scraped`);
-
         await Actor.pushData(result);
     },
 
